@@ -48,12 +48,22 @@ Yeni faza başlarken: aynı isimde klasör + `.ino` aç, başına amaç/güvenli
 | Sketch | Faz | Amaç | Durum |
 |---|---|---|---|
 | `Faz1_AktuatorTest` | 1 ⭐ | Servo sweep + motor ESC PWM testi (tekerler havada) | ✅ Hazır |
-| `Faz2_WifiTeleop` | 2 | WiFi'den elle gaz+direksiyon + fail-safe watchdog | ⏳ Planlı |
-| `Faz3_Sensorler` | 3 | IMU (I²C) + encoder (interrupt) + pil voltajı okuma | ⏳ Planlı |
-| `Faz4_HizPID` | 4 | Encoder geri besleme → hız PID → ESC | ⏳ Planlı |
-| `Faz5_PoseEKF` | 5 | UDP pose alımı + IMU/encoder füzyonu (EKF) | ⏳ Planlı |
-| `Faz6_YolTakibi` | 6 | Pure Pursuit / Stanley ile yol takibi | ⏳ Planlı |
-| `Faz7_LQR` | 7 | LQR + offline hız profili (MPC alternatifi) | ⏳ Planlı |
+| `Faz2_WifiTeleop` | 2 | WiFi'den elle gaz+direksiyon + fail-safe watchdog | ✅ Hazır |
+| `Faz3_Sensorler` | 3 | IMU (I²C) + encoder (interrupt) + pil voltajı okuma | ✅ Hazır |
+| `Faz4_HizPID` | 4 | Encoder geri besleme → hız PID → ESC | ✅ Hazır |
+| `Faz5_PoseEKF` | 5 | UDP pose alımı + IMU/encoder füzyonu (EKF) | ✅ Hazır |
+| `Faz6_YolTakibi` | 6 | Pure Pursuit ile yol takibi | ✅ Hazır |
+| `Faz7_LQR` | 7 | LQR + offline hız profili (MPC alternatifi) | ✅ Hazır |
+
+> **Önemli:** "Hazır" = kod yazıldı, ama **donanımda doğrulanmadı** (arduino-cli yok). Test **sıralı/alttan-üste** yapılır: Faz 3 sensörleri gerçek donanımda doğrulanmadan Faz 5 EKF'ine, o doğrulanmadan Faz 6/7'ye güvenme. Faz 5 (EKF) ve Faz 7 (LQR + hız profili) matematiği önce `../Simulation/` altında Python ile doğrulandı, sonra C'ye port edildi.
+
+### Faz 5 & 7 — Offline/Python eşlikçileri (`../Simulation/`)
+| Dosya | Ne işe yarar |
+|---|---|
+| `ekf_localization.py` | Faz 5 EKF referansı — sentetik veriyle doğrulandı (RMS ~5 cm) |
+| `fake_pose_sender.py` | Faz 5 testi: gerçek tracker yokken UDP'den sahte pose gönderir |
+| `offline_design.py` | Faz 7: hız profili + LQR kazançlarını hesaplar → `Faz7_LQR/track_data.h` üretir |
+| `bicycle_pure_pursuit.py` | Faz 6 referansı — Pure Pursuit (kararlı durum ~5.8 cm) |
 
 ---
 

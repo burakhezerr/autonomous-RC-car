@@ -84,6 +84,8 @@ const int SERVO_MIN    = 1000;  // tam sol
 const int SERVO_CENTER = 1500;  // duz
 const int SERVO_MAX    = 2000;  // tam sag
 
+const int ESC_MIN_US   = 1000;  // ESC sinyal araligi alt sinir (tam geri/min gaz)
+const int ESC_MAX_US   = 2000;  // ESC sinyal araligi ust sinir (tam ileri/max gaz)
 const int ESC_NEUTRAL  = 1500;  // cift yonlu (forward/reverse) RC ESC notru
 const int ESC_TEST_FWD = 1560;  // COK hafif ileri (sadece test). Yukseltme!
 
@@ -153,7 +155,7 @@ void setup() {
   servo.attach(PIN_SERVO, SERVO_MIN, SERVO_MAX);
 
   esc.setPeriodHertz(50);
-  esc.attach(PIN_ESC, 1000, 2000);
+  esc.attach(PIN_ESC, ESC_MIN_US, ESC_MAX_US);
 
   // GUVENLI BASLANGIC: motor notr (durur), servo merkez. Motor ARMED degil.
   disarmAll();
