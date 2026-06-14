@@ -13,9 +13,9 @@ const char* WIFI_PASS = "burakhezer";
 const int   WEB_PORT  = 5004;
 
 const int PIN_SERVO    = 38;
-const int SERVO_MIN    = 2400;
-const int SERVO_CENTER = 2500;
-const int SERVO_MAX    = 2600;
+const int SERVO_MIN    = 1700;
+const int SERVO_CENTER = 2000;
+const int SERVO_MAX    = 2300;
 
 const int PIN_ESC    = 41;
 const int ESC_MIN    = 1000;
