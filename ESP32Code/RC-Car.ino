@@ -61,22 +61,22 @@
  //     "build.extra_flags=-DSERVO_MIN_US=900 -DSERVO_MID_US=1480 -DSERVO_MAX_US=2100"
 
  #ifndef SERVO_MIN_US
- #define SERVO_MIN_US  1700
+ #define SERVO_MIN_US  1730
  #endif
  #ifndef SERVO_MID_US
- #define SERVO_MID_US  2000
+ #define SERVO_MID_US  2030
  #endif
  #ifndef SERVO_MAX_US
- #define SERVO_MAX_US  2300
+ #define SERVO_MAX_US  2330
  #endif
  #ifndef ESC_MIN_US
  #define ESC_MIN_US    1370
  #endif
  #ifndef ESC_MID_US
- #define ESC_MID_US    1470
+ #define ESC_MID_US    1540
  #endif
  #ifndef ESC_MAX_US
- #define ESC_MAX_US    1600
+ #define ESC_MAX_US    1570
  #endif
  
  // Throttle limits (percent, 0-100) — overridable via build flag:
