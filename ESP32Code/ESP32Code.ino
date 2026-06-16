@@ -27,17 +27,17 @@
  #include <Wire.h>
  #include <ESP32Servo.h>
  
- // Placed at top to avoid Arduino preprocessor prototype ordering issue
- typedef struct {
+ struct ImuData {
    float ax, ay, az, gx, gy, gz, temp;
    bool ok;
- } ImuData;
+ };
  
  // ---------------------------------------------------------------------------
  // WiFi
  // ---------------------------------------------------------------------------
- const char* SSID     = "Hezer";
- const char* PASSWORD = "burakhezer";
+ const char* SSID     = "Ando";
+ const char* PASSWORD = "andrey12";
+ const int   WEB_PORT = 5000;
 
  // ---------------------------------------------------------------------------
  // Pins
@@ -61,22 +61,22 @@
  //     "build.extra_flags=-DSERVO_MIN_US=900 -DSERVO_MID_US=1480 -DSERVO_MAX_US=2100"
 
  #ifndef SERVO_MIN_US
- #define SERVO_MIN_US  1730
+ #define SERVO_MIN_US  1820
  #endif
  #ifndef SERVO_MID_US
- #define SERVO_MID_US  2030
+ #define SERVO_MID_US  2040
  #endif
  #ifndef SERVO_MAX_US
- #define SERVO_MAX_US  2330
+ #define SERVO_MAX_US  2260
  #endif
  #ifndef ESC_MIN_US
- #define ESC_MIN_US    1370
+ #define ESC_MIN_US    1430
  #endif
  #ifndef ESC_MID_US
- #define ESC_MID_US    1540
+ #define ESC_MID_US    1495
  #endif
  #ifndef ESC_MAX_US
- #define ESC_MAX_US    1570
+ #define ESC_MAX_US    1560
  #endif
  
  // Throttle limits (percent, 0-100) — overridable via build flag:
@@ -99,6 +99,15 @@
  // Runtime-adjustable limits (default from compile-time defines)
  int throttleLimitPct = THROTTLE_LIMIT_PCT;
  int steerLimitPct    = 100;  // 100% = full servo range, lower = narrower steering
+
+ // ---------------------------------------------------------------------------
+ // Run mode
+ // ---------------------------------------------------------------------------
+ enum RunMode { MODE_MANUAL, MODE_AUTO };
+ RunMode runMode = MODE_MANUAL;
+ String lastAutoLog = "";
+ bool   autoWallRecover = false;
+ unsigned long wallEmergencyMs = 0;
  
  // ---------------------------------------------------------------------------
  // Arm / E-Stop state machine
@@ -214,7 +223,90 @@
      lunaDistCm = (lunaStr < 100) ? -1 : (buf[0] | (buf[1] << 8));
    }
  }
- 
+
+ // ---------------------------------------------------------------------------
+ // Autonomous control helpers
+ // ---------------------------------------------------------------------------
+ int proximityLevel(float cm) {
+   if (cm < 0)   return 5;
+   if (cm <= 35) return 1;
+   if (cm <= 60) return 2;
+   if (cm <= 85) return 3;
+   if (cm <= 115) return 4;
+   return 5;
+ }
+
+ void autoControl() {
+   if (armState != ARMED) return;
+
+   // LiDAR wall detection — takes priority
+   if (lunaDistCm > 0 && lunaDistCm <= 25) {
+     escUs = ESC_MID_US; servoUs = SERVO_MID_US;
+     esc.writeMicroseconds(ESC_MID_US);
+     steerServo.writeMicroseconds(SERVO_MID_US);
+     armState          = EMERGENCY;
+     disarmReason      = "wall_detected";
+     autoWallRecover   = true;
+     wallEmergencyMs   = millis();
+     lastAutoLog       = "Wall detected";
+     Serial.println("[AUTO] Wall detected — EMERGENCY");
+     return;
+   }
+
+   // Sonar ≤10cm: stop + full steer away (4-level equivalent)
+   bool leftClose  = (lastLeft  > 0 && lastLeft  <= 10.0f);
+   bool rightClose = (lastRight > 0 && lastRight <= 10.0f);
+   if (leftClose || rightClose) {
+     escUs = ESC_MID_US;
+     esc.writeMicroseconds(ESC_MID_US);
+     if (leftClose && !rightClose)       servoUs = SERVO_MAX_US;
+     else if (rightClose && !leftClose)  servoUs = SERVO_MIN_US;
+     else                                servoUs = SERVO_MID_US;
+     steerServo.writeMicroseconds(servoUs);
+     lastAutoLog = "Sonar emergency — steering away";
+     return;
+   }
+
+   // Ultrasonic proximity steering
+   int lvL  = proximityLevel(lastLeft);
+   int lvR  = proximityLevel(lastRight);
+   int diff = lvR - lvL;
+   if (diff == 0) {
+     servoUs = SERVO_MID_US;
+   } else {
+     int   ad  = abs(diff);
+     float pct = (ad == 1) ? 0.25f : (ad == 2) ? 0.50f : (ad == 3) ? 0.75f : 1.00f;
+     servoUs = (diff > 0)
+       ? SERVO_MID_US + (int)((SERVO_MAX_US - SERVO_MID_US) * pct)
+       : SERVO_MID_US - (int)((SERVO_MID_US - SERVO_MIN_US) * pct);
+   }
+   servoUs = constrain(servoUs, SERVO_MIN_US, SERVO_MAX_US);
+   steerServo.writeMicroseconds(servoUs);
+
+   // LiDAR-based speed: >100cm=max, 25-100cm=medium
+   int autoUs;
+   if (lunaDistCm < 0 || lunaDistCm > 100) {
+     autoUs      = 1560;
+     lastAutoLog = "Full speed";
+   } else {
+     autoUs      = 1550;
+     lastAutoLog = "Slowing — obstacle ahead";
+   }
+   escUs = autoUs;
+   esc.writeMicroseconds(escUs);
+ }
+
+ void manualSafety() {
+   if (armState != ARMED) return;
+   bool sonarDanger = (lastLeft  >= 0 && lastLeft  <= 10.0f)
+                   || (lastRight >= 0 && lastRight <= 10.0f);
+   bool lidarDanger = (lunaDistCm > 0 && lunaDistCm <= 25);
+   if (sonarDanger || lidarDanger) {
+     escUs = ESC_MID_US;
+     esc.writeMicroseconds(ESC_MID_US);
+   }
+ }
+
  // ---------------------------------------------------------------------------
  // MPU6050
  // ---------------------------------------------------------------------------
@@ -318,14 +410,14 @@
    digitalWrite(trig, LOW);  delayMicroseconds(2);
    digitalWrite(trig, HIGH); delayMicroseconds(10);
    digitalWrite(trig, LOW);
-   long dur = pulseIn(echo, HIGH, 6000);  // 6ms = ~1m range
+   long dur = pulseIn(echo, HIGH, 15000);  // 15ms = ~2.6m range
    return dur == 0 ? -1 : dur / 58.0f;
  }
  
  // ---------------------------------------------------------------------------
  // Web server
  // ---------------------------------------------------------------------------
- WebServer server(5000);
+ WebServer server(WEB_PORT);
  
  // ---------------------------------------------------------------------------
  // HTML
@@ -358,10 +450,7 @@
      .tile.warn .val{color:#ff6b6b}
      .tile.err  .val{color:#333;font-size:16px}
  
-     #chart-wrap{background:#0d1117;border:1px solid #1e1e1e;border-radius:12px;
-                 padding:12px;margin-top:8px}
-     #chart{display:block;width:100%;height:160px}
-     #chart-info{font-size:9px;color:#2a2a2a;margin-top:6px;text-align:right}
+
  
      #upd{font-size:10px;color:#2a2a2a;margin-top:18px;text-align:center}
  
@@ -392,12 +481,48 @@
    <h1>RC Car — ESP32-S3</h1>
    <p class="sub">Sensor Dashboard / Phase 0.5</p>
 
-   <h2>TF-Luna — Distance History</h2>
-   <div id="chart-wrap">
-     <canvas id="chart"></canvas>
-     <div id="chart-info">—</div>
+   <h2>Joystick Control</h2>
+   <div class="ctrl">
+     <div id="gp-status" style="font-size:10px;color:#555;margin-bottom:8px">No gamepad — press any button on controller</div>
+     <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+       <div>
+         <div class="slider-lbl">Servo µs — min / mid / max</div>
+         <div style="display:flex;gap:4px">
+           <input type="number" id="gp-smin" value="1820" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+           <input type="number" id="gp-smid" value="2040" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+           <input type="number" id="gp-smax" value="2260" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+         </div>
+       </div>
+       <div>
+         <div class="slider-lbl">ESC µs — min / mid / max</div>
+         <div style="display:flex;gap:4px">
+           <input type="number" id="gp-emin" value="1070" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+           <input type="number" id="gp-emid" value="1540" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+           <input type="number" id="gp-emax" value="1750" style="width:56px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px">
+         </div>
+       </div>
+     </div>
+     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;font-size:11px;color:#666;flex-wrap:wrap">
+       <label>Steer axis: <select id="gp-sa" style="background:#1e1e1e;color:#82b1ff;border:1px solid #333;border-radius:4px;padding:2px;font-size:11px"><option value="0" selected>L-X (0)</option><option value="1">L-Y (1)</option><option value="2">R-X (2)</option><option value="3">R-Y (3)</option></select></label>
+       <label>Thr axis: <select id="gp-ta" style="background:#1e1e1e;color:#82b1ff;border:1px solid #333;border-radius:4px;padding:2px;font-size:11px"><option value="0">L-X (0)</option><option value="1" selected>L-Y (1)</option><option value="2">R-X (2)</option><option value="3">R-Y (3)</option></select></label>
+       <label>Deadzone: <input type="number" id="gp-dz" value="0.08" step="0.01" min="0" max="0.5" style="width:44px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;border-radius:4px;padding:2px;font-size:11px;font-family:monospace;text-align:center"></label>
+     </div>
+     <div style="display:flex;justify-content:center;margin:12px 0;gap:16px;align-items:center">
+       <div id="joy-outer" touch-action="none"
+         style="width:160px;height:160px;border-radius:50%;border:2px solid #444;background:#111;position:relative;cursor:grab;user-select:none;flex-shrink:0"
+         onpointerdown="joyDown(event)" onpointermove="joyMove(event)" onpointerup="joyUp(event)" onpointercancel="joyUp(event)">
+         <div style="position:absolute;top:50%;left:0;right:0;height:1px;background:#222;transform:translateY(-50%)"></div>
+         <div style="position:absolute;left:50%;top:0;bottom:0;width:1px;background:#222;transform:translateX(-50%)"></div>
+         <div id="joy-inner" style="width:48px;height:48px;border-radius:50%;background:#82b1ff;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);pointer-events:none"></div>
+       </div>
+       <div style="display:flex;flex-direction:column;gap:6px">
+         <div class="tile" style="min-width:72px"><div class="lbl">Steer</div><div class="val" id="gp-sa-val" style="font-size:18px">—</div></div>
+         <div class="tile" style="min-width:72px"><div class="lbl">Throttle</div><div class="val" id="gp-ta-val" style="font-size:18px">—</div></div>
+       </div>
+     </div>
+     <button id="btn-gp" class="btn" onclick="toggleGp()" disabled style="background:#333;color:#555">GAMEPAD OFF</button>
    </div>
- 
+
    <h2>LiDAR Live</h2>
    <div class="grid3">
      <div class="tile" id="box-luna"><div class="lbl">Distance</div><div class="val" id="val-luna">—</div><div class="unit">cm</div></div>
@@ -409,6 +534,16 @@
    <div class="grid2">
      <div class="tile" id="box-l"><div class="lbl">Left</div><div class="val" id="val-l">—</div><div class="unit">cm</div></div>
      <div class="tile" id="box-r"><div class="lbl">Right</div><div class="val" id="val-r">—</div><div class="unit">cm</div></div>
+   </div>
+   <div style="display:flex;gap:12px;margin-top:10px">
+     <div style="flex:1">
+       <div style="font-size:10px;color:#666;margin-bottom:4px;text-align:center">LEFT PROXIMITY</div>
+       <div id="prox-l" style="display:flex;gap:3px;justify-content:center"></div>
+     </div>
+     <div style="flex:1">
+       <div style="font-size:10px;color:#666;margin-bottom:4px;text-align:center">RIGHT PROXIMITY</div>
+       <div id="prox-r" style="display:flex;gap:3px;justify-content:center"></div>
+     </div>
    </div>
  
    <h2>IMU</h2>
@@ -425,6 +560,15 @@
        <button class="btn btn-arm"    id="btn-arm"    onclick="sendArm()">ARM</button>
        <button class="btn btn-disarm" id="btn-disarm" onclick="sendDisarm()">DISARM</button>
        <button class="btn btn-estop"  id="btn-estop"  onclick="sendEstop()">E-STOP</button>
+       <button class="btn" id="btn-auto" onclick="sendMode()" style="background:#333;color:#aaa">AUTO OFF</button>
+     </div>
+     <div id="auto-info" style="display:none;margin-top:10px">
+       <div class="grid2">
+         <div class="tile"><div class="lbl">Left Level</div><div class="val" id="lv-l" style="font-size:28px">—</div></div>
+         <div class="tile"><div class="lbl">Right Level</div><div class="val" id="lv-r" style="font-size:28px">—</div></div>
+       </div>
+       <div style="font-size:10px;color:#555;margin-top:6px;text-align:center">Lv1≤45 · Lv2≤60 · Lv3≤75 · Lv4≤95 · sonar≤10cm→stop+steer · LiDAR≤25cm→EMERGENCY · LiDAR>100cm→full</div>
+       <div id="auto-log" style="margin-top:8px;padding:6px 10px;background:#111;border:1px solid #333;border-radius:6px;font-size:12px;color:#00e676;font-family:monospace;min-height:24px;text-align:center">—</div>
      </div>
      <div class="slider-row">
        <div class="slider-lbl">Steering (µs)</div>
@@ -433,68 +577,20 @@
        <div class="slider-val" id="steer-val">1500 µs</div>
      </div>
      <div class="slider-row">
-       <div class="slider-lbl" style="display:flex;justify-content:space-between;align-items:center">
-         <span>Throttle (µs)</span>
-         <span style="display:flex;align-items:center;gap:4px">
-           Limit:
-           <input type="number" id="thr-limit-input" min="0" max="100" value="30" step="1"
-             style="width:48px;background:#1e1e1e;border:1px solid #333;color:#82b1ff;
-                    font-size:11px;font-family:monospace;text-align:center;border-radius:4px;padding:2px"
-             onchange="setThrLimit(this.value)">%
-         </span>
-       </div>
-       <input type="range" id="sl-thr" min="1000" max="2000" value="1500" step="10"
+       <div class="slider-lbl">Throttle (µs)</div>
+       <input type="range" id="sl-thr" min="1430" max="1560" value="1495" step="1"
               oninput="thrVal(this.value); scheduleControl()">
        <div class="slider-val" id="thr-val">1500 µs</div>
      </div>
    </div>
 
+
+
    <div id="upd">waiting...</div>
  </div>
  
  <script>
- const MAX_PTS = 60;
- const MAX_CM  = 500;
- const history = [];
- 
- const canvas = document.getElementById('chart');
- const ctx    = canvas.getContext('2d');
- 
- function drawChart() {
-   const W = canvas.offsetWidth, H = canvas.offsetHeight;
-   canvas.width = W; canvas.height = H;
-   ctx.clearRect(0,0,W,H);
- 
-   // izgara cizgileri
-   [100,200,300,400].forEach(v=>{
-     const y = H - (v/MAX_CM)*H;
-     ctx.strokeStyle='#1a1a1a'; ctx.lineWidth=1;
-     ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke();
-     ctx.fillStyle='#2a2a2a'; ctx.font='9px monospace';
-     ctx.fillText(v+'cm',4,y-2);
-   });
- 
-   if(history.length<2) return;
- 
-   // cizgi
-   ctx.beginPath();
-   history.forEach((v,i)=>{
-     const x = (i/(MAX_PTS-1))*W;
-     const y = v<0 ? H : H-(Math.min(v,MAX_CM)/MAX_CM)*H;
-     i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-   });
-   ctx.strokeStyle='#00e676'; ctx.lineWidth=2; ctx.stroke();
- 
-   // son nokta vurgusu
-   const last = history[history.length-1];
-   if(last>=0){
-     const x=(history.length-1)/(MAX_PTS-1)*W;
-     const y=H-(Math.min(last,MAX_CM)/MAX_CM)*H;
-     ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI);
-     ctx.fillStyle= last<30?'#ff6b6b':'#00e676'; ctx.fill();
-   }
- }
- 
+
  function setTile(vi,bi,v,dec,warnFn){
    const ve=document.getElementById(vi), be=document.getElementById(bi);
    if(!be||!ve) return;
@@ -507,19 +603,25 @@
    try{
      const d=await fetch('/data').then(r=>r.json());
  
-     // Grafige ekle
-     history.push(d.luna);
-     if(history.length>MAX_PTS) history.shift();
-     drawChart();
-     document.getElementById('chart-info').textContent=
-       'Last: '+(d.luna>=0?d.luna+'cm':'invalid')+
-       ' | Signal: '+d.lstr;
- 
      setTile('val-luna','box-luna', d.luna, 0, v=>v<25);
      setTile('val-lstr','box-lstr', d.lstr>0?d.lstr:null, 0, v=>v<200);
      setTile('val-ltmp','box-ltmp', d.ltmp, 1);
      setTile('val-l','box-l', d.left,  1, v=>v<20);
      setTile('val-r','box-r', d.right, 1, v=>v<20);
+     drawProx('prox-l', d.lLv);
+     drawProx('prox-r', d.rLv);
+     if(autoMode){
+       const lvlColor=v=>v<=2;
+       const el=document.getElementById('lv-l');
+       if(el){ el.textContent=d.lLv??'—'; el.style.color=lvlColor(d.lLv)?'#ff5252':'#69f0ae'; }
+       const er=document.getElementById('lv-r');
+       if(er){ er.textContent=d.rLv??'—'; er.style.color=lvlColor(d.rLv)?'#ff5252':'#69f0ae'; }
+       const al=document.getElementById('auto-log');
+       if(al&&d.alog!=null){
+         al.textContent=d.alog||'—';
+         al.style.color=d.alog==='Wall detected'?'#ff1744':d.alog.startsWith('Wall cleared')?'#69f0ae':'#00e676';
+       }
+     }
  
      if(d.imu_ok){
        document.getElementById('val-ax').textContent=d.ax.toFixed(2);
@@ -535,35 +637,38 @@
  
  // --- Arm state UI ---
  let currentState = 'DISARMED';
+ let neutralSteer = 2040, neutralThr = 1540;
+ let autoMode = false;
  function updateStateBadge(state){
    currentState = state;
    const b = document.getElementById('state-badge');
    b.textContent = state;
    b.className = 'state-' + state.toLowerCase();
-   const armed = state === 'ARMED';
+   const armed = state === 'ARMED' && !autoMode;
    document.getElementById('sl-steer').disabled = !armed;
    document.getElementById('sl-thr').disabled   = !armed;
  }
  
  function steerVal(v){ document.getElementById('steer-val').textContent = v + ' µs'; }
  function thrVal(v)  { document.getElementById('thr-val').textContent   = v + ' µs'; }
- 
- async function setThrLimit(v){
-   v = Math.min(100, Math.max(0, parseInt(v)||0));
-   document.getElementById('thr-limit-input').value = v;
-   try{
-     const r = await fetch('/set?thr_limit='+v,{method:'POST'});
-     const d = await r.json();
-     if(d.ok){
-       // update slider max
-       const eMid = parseInt(document.getElementById('sl-thr').value)||1470;
-       const curMid = 1470; // ESC_MID_US
-       const curMax = 1800; // ESC_MAX_US
-       const maxUs = curMid + Math.round((curMax - curMid) * v / 100);
-       document.getElementById('sl-thr').max = maxUs;
+ const PROX_COLORS=['#ff1744','#ff5722','#ffc107','#8bc34a','#00e676'];
+ function drawProx(id, lv){
+   const el=document.getElementById(id); if(!el)return;
+   if(!el.children.length){
+     for(let i=1;i<=5;i++){
+       const d=document.createElement('div');
+       d.style.cssText='width:28px;height:28px;border-radius:4px;border:1px solid #333;transition:background 0.2s;display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;font-weight:bold';
+       d.textContent=i; el.appendChild(d);
      }
-   } catch(e){}
+   }
+   Array.from(el.children).forEach((d,i)=>{
+     const active=lv!=null&&(i+1)===lv;
+     d.style.background=active?PROX_COLORS[i]:'#1a1a1a';
+     d.style.borderColor=active?PROX_COLORS[i]:'#333';
+   });
  }
+ 
+
 
  // 80ms throttle on slider oninput — avoids flooding ESP32
  let _ctrlTimer = null;
@@ -580,19 +685,35 @@
  async function sendDisarm(){
    try{ const r=await fetch('/disarm',{method:'POST'}); const d=await r.json();
      if(d.ok){ updateStateBadge('DISARMED');
-       document.getElementById('sl-steer').value=1500; steerVal(1500);
-       document.getElementById('sl-thr').value=1500;   thrVal(1500); }
+       document.getElementById('sl-steer').value=neutralSteer; steerVal(neutralSteer);
+       document.getElementById('sl-thr').value=neutralThr;     thrVal(neutralThr); }
    } catch(e){ alert('DISARM error'); }
  }
  async function sendEstop(){
    try{ const r=await fetch('/estop',{method:'POST'}); const d=await r.json();
      if(d.ok){ updateStateBadge('EMERGENCY');
-       document.getElementById('sl-steer').value=1500; steerVal(1500);
-       document.getElementById('sl-thr').value=1500;   thrVal(1500); }
+       document.getElementById('sl-steer').value=neutralSteer; steerVal(neutralSteer);
+       document.getElementById('sl-thr').value=neutralThr;     thrVal(neutralThr); }
    } catch(e){ alert('E-STOP error'); }
  }
+ async function sendMode(){
+   const next = autoMode ? 'manual' : 'auto';
+   try{
+     const r=await fetch('/mode?mode='+next,{method:'POST'}); const d=await r.json();
+     if(d.ok){
+       autoMode=(d.mode==='AUTO');
+       const b=document.getElementById('btn-auto');
+       b.textContent=autoMode?'AUTO ON':'AUTO OFF';
+       b.style.background=autoMode?'#00c853':'#333';
+       b.style.color=autoMode?'#000':'#aaa';
+       document.getElementById('auto-info').style.display=autoMode?'block':'none';
+       if(autoMode && gpOn) toggleGp();
+       updateStateBadge(currentState);
+     }
+   } catch(e){ alert('Mode error'); }
+ }
  async function sendControl(){
-   if(currentState !== 'ARMED') return;
+   if(currentState !== 'ARMED' || autoMode) return;
    const steer = document.getElementById('sl-steer').value;
    const thr   = document.getElementById('sl-thr').value;
    try{ await fetch('/control?steer='+steer+'&thr='+thr,{method:'POST'}); }
@@ -605,24 +726,120 @@
    const cfg=d.config, tel=d.telemetry;
    if(cfg){
      const sMin=cfg.servo?.minUs, sMid=cfg.servo?.neutralUs, sMax=cfg.servo?.maxUs;
-     if(sMin!=null) document.getElementById('sl-steer').min=sMin;
-     if(sMax!=null) document.getElementById('sl-steer').max=sMax;
-     if(sMid!=null){ document.getElementById('sl-steer').value=sMid; steerVal(sMid); }
-     const eMin=cfg.esc?.minUs, eMid=cfg.esc?.neutralUs, eMax=cfg.esc?.maxUs??2000;
-     if(eMin!=null) document.getElementById('sl-thr').min=eMin;
-     if(eMid!=null){ document.getElementById('sl-thr').value=eMid; thrVal(eMid); }
-     const lim=tel?.limits?.throttleLimit;
-     if(lim!=null){
-       document.getElementById('thr-limit-input').value=lim;
-       const maxUs=(eMid??1470)+Math.round((eMax-(eMid??1470))*lim/100);
-       document.getElementById('sl-thr').max=maxUs;
-     }
+     if(sMin!=null){ document.getElementById('sl-steer').min=sMin; document.getElementById('gp-smin').value=sMin; document.getElementById('gp-smin').min=sMin; }
+     if(sMax!=null){ document.getElementById('sl-steer').max=sMax; document.getElementById('gp-smax').value=sMax; document.getElementById('gp-smax').max=sMax; }
+     if(sMid!=null){ neutralSteer=sMid; document.getElementById('sl-steer').value=sMid; steerVal(sMid); document.getElementById('gp-smid').value=sMid; document.getElementById('gp-smin').max=sMid; document.getElementById('gp-smax').min=sMid; }
+     const eMin=cfg.esc?.minUs, eMid=cfg.esc?.neutralUs, eMax=cfg.esc?.maxUs;
+     if(eMin!=null){ document.getElementById('sl-thr').min=eMin; document.getElementById('gp-emin').value=eMin; document.getElementById('gp-emin').min=eMin; }
+     if(eMax!=null){ document.getElementById('sl-thr').max=eMax; document.getElementById('gp-emax').value=eMax; document.getElementById('gp-emax').max=eMax; }
+     if(eMid!=null){ neutralThr=eMid; document.getElementById('sl-thr').value=eMid; thrVal(eMid); document.getElementById('gp-emid').value=eMid; document.getElementById('gp-emin').max=eMid; document.getElementById('gp-emax').min=eMid; }
    }
  }).catch(()=>{});
  
  poll();
  setInterval(poll, 500);
- window.addEventListener('resize', drawChart);
+
+
+ // --- Gamepad ---
+ let gpOn=false,gpIdx=-1,gpTimer=null;
+ window.addEventListener('gamepadconnected',e=>{
+   gpIdx=e.gamepad.index;
+   document.getElementById('gp-status').textContent='Connected: '+e.gamepad.id.slice(0,60);
+   const b=document.getElementById('btn-gp');
+   b.disabled=false;b.style.background='#333';b.style.color='#fff';
+ });
+ window.addEventListener('gamepaddisconnected',e=>{
+   if(e.gamepad.index!==gpIdx)return;
+   gpIdx=-1;gpOn=false;stopGp();
+   document.getElementById('gp-status').textContent='No gamepad — press any button on controller';
+   const b=document.getElementById('btn-gp');
+   b.disabled=true;b.style.background='#333';b.style.color='#555';b.textContent='GAMEPAD OFF';
+ });
+ function toggleGp(){
+   gpOn=!gpOn;
+   gpOn?startGp():stopGp();
+   const b=document.getElementById('btn-gp');
+   b.textContent=gpOn?'GAMEPAD ON':'GAMEPAD OFF';
+   b.style.background=gpOn?'#00c853':'#333';
+   b.style.color=gpOn?'#000':'#fff';
+ }
+ function startGp(){if(!gpTimer)gpTimer=setInterval(gpPoll,50);}
+ function stopGp(){if(gpTimer){clearInterval(gpTimer);gpTimer=null;}}
+ function gpPoll(){
+   const gp=navigator.getGamepads()[gpIdx];
+   if(!gp)return;
+   const dz=parseFloat(document.getElementById('gp-dz').value)||0.08;
+   const saI=parseInt(document.getElementById('gp-sa').value)||0;
+   const taI=parseInt(document.getElementById('gp-ta').value)||1;
+   let sa=gp.axes[saI]||0,ta=gp.axes[taI]||0;
+   if(Math.abs(sa)<dz)sa=0;
+   if(Math.abs(ta)<dz)ta=0;
+   document.getElementById('gp-sa-val').textContent=sa.toFixed(2);
+   document.getElementById('gp-ta-val').textContent=ta.toFixed(2);
+   if(!gpOn||currentState!=='ARMED')return;
+   const sMin=parseInt(document.getElementById('gp-smin').value)||1730;
+   const sMid=parseInt(document.getElementById('gp-smid').value)||2030;
+   const sMax=parseInt(document.getElementById('gp-smax').value)||2330;
+   const eMin=parseInt(document.getElementById('gp-emin').value)||1070;
+   const eMid=parseInt(document.getElementById('gp-emid').value)||1540;
+   const eMax=parseInt(document.getElementById('gp-emax').value)||1750;
+   const stUs=Math.round(sa<0?sMid+sa*(sMid-sMin):sMid+sa*(sMax-sMid));
+   const thUs=Math.round(ta<0?eMid-ta*(eMax-eMid):eMid-ta*(eMid-eMin));
+   document.getElementById('sl-steer').value=stUs;steerVal(stUs);
+   document.getElementById('sl-thr').value=thUs;thrVal(thUs);
+   fetch('/control?steer='+stUs+'&thr='+thUs,{method:'POST'}).catch(()=>{});
+ }
+
+ // --- Virtual Joystick ---
+ let joyActive=false,joyCX=0,joyCY=0,joyR=0,joySa=0,joyTa=0,joyTimer=null;
+ function joyDown(e){
+   e.currentTarget.setPointerCapture(e.pointerId);
+   const rc=e.currentTarget.getBoundingClientRect();
+   joyCX=rc.left+rc.width/2; joyCY=rc.top+rc.height/2; joyR=rc.width/2-24;
+   joyActive=true; joyMove(e);
+   if(!joyTimer)joyTimer=setInterval(joyPoll,50);
+ }
+ function joyMove(e){
+   if(!joyActive)return;
+   const dx=e.clientX-joyCX, dy=e.clientY-joyCY;
+   const dist=Math.sqrt(dx*dx+dy*dy);
+   const s=Math.min(dist,joyR)/Math.max(dist,0.001);
+   const cx=dx*s, cy=dy*s;
+   joySa=cx/joyR; joyTa=-cy/joyR;
+   const half=joyR+24;
+   const inn=document.getElementById('joy-inner');
+   inn.style.left=(half+cx)+'px'; inn.style.top=(half+cy)+'px';
+   inn.style.transform='translate(-50%,-50%)';
+   document.getElementById('gp-sa-val').textContent=joySa.toFixed(2);
+   document.getElementById('gp-ta-val').textContent=joyTa.toFixed(2);
+ }
+ function joyUp(e){
+   joyActive=false; joySa=0; joyTa=0;
+   const inn=document.getElementById('joy-inner');
+   inn.style.left='50%'; inn.style.top='50%'; inn.style.transform='translate(-50%,-50%)';
+   document.getElementById('gp-sa-val').textContent='0.00';
+   document.getElementById('gp-ta-val').textContent='0.00';
+   if(joyTimer){clearInterval(joyTimer);joyTimer=null;}
+   if(currentState==='ARMED'){
+     const sMid=parseInt(document.getElementById('gp-smid').value)||2030;
+     const eMid=parseInt(document.getElementById('gp-emid').value)||1540;
+     fetch('/control?steer='+sMid+'&thr='+eMid,{method:'POST'}).catch(()=>{});
+   }
+ }
+ function joyPoll(){
+   if(!joyActive||currentState!=='ARMED')return;
+   const sMin=parseInt(document.getElementById('gp-smin').value)||1730;
+   const sMid=parseInt(document.getElementById('gp-smid').value)||2030;
+   const sMax=parseInt(document.getElementById('gp-smax').value)||2330;
+   const eMin=parseInt(document.getElementById('gp-emin').value)||1070;
+   const eMid=parseInt(document.getElementById('gp-emid').value)||1540;
+   const eMax=parseInt(document.getElementById('gp-emax').value)||1750;
+   const stUs=Math.round(joySa<0?sMid+joySa*(sMid-sMin):sMid+joySa*(sMax-sMid));
+   const thUs=Math.round(joyTa>=0?eMid+joyTa*(eMax-eMid):eMid+joyTa*(eMid-eMin));
+   document.getElementById('sl-steer').value=stUs; steerVal(stUs);
+   document.getElementById('sl-thr').value=thUs; thrVal(thUs);
+   fetch('/control?steer='+stUs+'&thr='+thUs,{method:'POST'}).catch(()=>{});
+ }
  </script>
  </body>
  </html>
@@ -726,13 +943,13 @@ const char OPENAPI_JSON[] PROGMEM = R"rawliteral(
         "parameters":[
           {
             "name":"steer","in":"query","required":false,
-            "description":"Servo µs: 1000=full left | 1500=centre | 2000=full right",
-            "schema":{"type":"integer","minimum":1000,"maximum":2000,"example":1500}
+            "description":"Servo µs: 1730=full left | 2030=centre | 2330=full right",
+            "schema":{"type":"integer","minimum":1730,"maximum":2330,"example":2030}
           },
           {
             "name":"thr","in":"query","required":false,
-            "description":"ESC µs: 1500=neutral | max=(neutral + range * PCT/100)",
-            "schema":{"type":"integer","minimum":1000,"maximum":2000,"example":1500}
+            "description":"ESC µs: 1490=neutral | 1430=full forward | 1550=full reverse",
+            "schema":{"type":"integer","minimum":1430,"maximum":1550,"example":1490}
           }
         ],
         "responses":{
@@ -795,20 +1012,25 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    cfUpdate(lastImu);
    float l = lastLeft, r = lastRight;
    ImuData imu = lastImu;
-   char buf[256];
+   int lvL = proximityLevel(l), lvR = proximityLevel(r);
+   char buf[384];
    if (imu.ok) {
      snprintf(buf, sizeof(buf),
-       "{\"left\":%.1f,\"right\":%.1f,"
+       "{\"left\":%.1f,\"right\":%.1f,\"lLv\":%d,\"rLv\":%d,"
        "\"luna\":%d,\"lstr\":%d,\"ltmp\":%.1f,"
        "\"imu_ok\":true,\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,"
-       "\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"temp\":%.1f}",
-       l, r, lunaDistCm, lunaStr, lunaTemp,
-       imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz, imu.temp);
+       "\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"temp\":%.1f,"
+       "\"alog\":\"%s\"}",
+       l, r, lvL, lvR, lunaDistCm, lunaStr, lunaTemp,
+       imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz, imu.temp,
+       lastAutoLog.c_str());
    } else {
      snprintf(buf, sizeof(buf),
-       "{\"left\":%.1f,\"right\":%.1f,"
-       "\"luna\":%d,\"lstr\":%d,\"ltmp\":%.1f,\"imu_ok\":false}",
-       l, r, lunaDistCm, lunaStr, lunaTemp);
+       "{\"left\":%.1f,\"right\":%.1f,\"lLv\":%d,\"rLv\":%d,"
+       "\"luna\":%d,\"lstr\":%d,\"ltmp\":%.1f,\"imu_ok\":false,"
+       "\"alog\":\"%s\"}",
+       l, r, lvL, lvR, lunaDistCm, lunaStr, lunaTemp,
+       lastAutoLog.c_str());
    }
    addCORS();
    server.send(200, "application/json", buf);
@@ -822,14 +1044,7 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    float rFwd = lastRight > 0 ? lastRight * SONAR_COS : -1;
    float rLat = lastRight > 0 ? lastRight * SONAR_SIN : -1;
  
-   auto proxLv = [](float cm) -> int {
-     if (cm < 0)   return 0;
-     if (cm < 20)  return 4;
-     if (cm < 50)  return 3;
-     if (cm < 100) return 2;
-     if (cm < 200) return 1;
-     return 0;
-   };
+   auto proxLv = [](float cm) -> int { return proximityLevel(cm); };
  
    bool lidarOk = lunaDistCm > 0;
  
@@ -911,11 +1126,12 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
      char sbuf[128];
      snprintf(sbuf, sizeof(sbuf),
        "\"system\":{\"mstate\":\"%s\",\"armPct\":%d,"
-       "\"disarmReason\":\"%s\",\"mode\":\"MANUAL\","
+       "\"disarmReason\":\"%s\",\"mode\":\"%s\","
        "\"emergency\":%s},",
        mstate,
        armState == ARMED ? 100 : 0,
        disarmReason.c_str(),
+       runMode == MODE_AUTO ? "AUTO" : "MANUAL",
        armState == EMERGENCY ? "true" : "false");
      j += sbuf;
    }
@@ -930,8 +1146,8 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    {
      char lbuf[64];
      snprintf(lbuf, sizeof(lbuf),
-       "\"limits\":{\"throttleLimit\":%d,\"autoThrottle\":%d}",
-       throttleLimitPct, AUTO_THROTTLE_PCT);
+       "\"limits\":{\"throttleLimit\":100,\"autoThrottle\":%d}",
+       AUTO_THROTTLE_PCT);
      j += lbuf;
    }
  
@@ -973,6 +1189,10 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
      server.send(403, "application/json", "{\"ok\":false,\"msg\":\"ARM degil\"}");
      return;
    }
+   if (runMode == MODE_AUTO) {
+     server.send(403, "application/json", "{\"ok\":false,\"msg\":\"AUTO mode\"}");
+     return;
+   }
    if (server.hasArg("steer")) {
      int sMinLim = SERVO_MID_US - (int)((SERVO_MID_US - SERVO_MIN_US) * steerLimitPct / 100.0f);
      int sMaxLim = SERVO_MID_US + (int)((SERVO_MAX_US - SERVO_MID_US) * steerLimitPct / 100.0f);
@@ -981,11 +1201,11 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
      steerServo.writeMicroseconds(us);
    }
    if (server.hasArg("thr")) {
-     int maxUs = ESC_MID_US + (int)((ESC_MAX_US - ESC_MID_US) * throttleLimitPct / 100.0f);
-     int us    = constrain(server.arg("thr").toInt(), ESC_MIN_US, maxUs);
+     int us = constrain(server.arg("thr").toInt(), ESC_MIN_US, ESC_MAX_US);
      escUs = us;
      esc.writeMicroseconds(us);
    }
+   manualSafety();  // override throttle if too close
    char rbuf[64];
    snprintf(rbuf, sizeof(rbuf),
      "{\"ok\":true,\"servoUs\":%d,\"escUs\":%d}", servoUs, escUs);
@@ -1017,6 +1237,31 @@ void handleSet() {
            throttleLimitPct, steerLimitPct);
   server.send(200, "application/json", buf);
 }
+
+ void handleMode() {
+   addCORS();
+   if (!server.hasArg("mode")) {
+     server.send(400, "application/json", "{\"ok\":false,\"msg\":\"no mode param\"}");
+     return;
+   }
+   String m = server.arg("mode");
+   if (m == "auto") {
+     runMode         = MODE_AUTO;
+     autoWallRecover = false;
+     lastAutoLog     = "";
+     Serial.println("[MODE] AUTO");
+   } else {
+     runMode = MODE_MANUAL;
+     if (armState == ARMED) {
+       escUs = ESC_MID_US; servoUs = SERVO_MID_US;
+       esc.writeMicroseconds(ESC_MID_US);
+       steerServo.writeMicroseconds(SERVO_MID_US);
+     }
+     Serial.println("[MODE] MANUAL");
+   }
+   String resp = String("{\"ok\":true,\"mode\":\"") + (runMode == MODE_AUTO ? "AUTO" : "MANUAL") + "\"}";
+   server.send(200, "application/json", resp);
+ }
 
 void handleNotFound() { server.send(404, "text/plain", "Not found"); }
  
@@ -1089,6 +1334,8 @@ void handleNotFound() { server.send(404, "text/plain", "Not found"); }
    server.on("/control", HTTP_OPTIONS, handleOptions);
    server.on("/set",     HTTP_POST,    handleSet);
    server.on("/set",     HTTP_OPTIONS, handleOptions);
+   server.on("/mode",    HTTP_POST,    handleMode);
+   server.on("/mode",    HTTP_OPTIONS, handleOptions);
    server.onNotFound(handleNotFound);
    server.begin();
    Serial.println("http://esp.local:5000");
@@ -1101,13 +1348,36 @@ void handleNotFound() { server.send(404, "text/plain", "Not found"); }
    checkButtons();
    lunaUpdate();
    server.handleClient();
- 
-   // IMU'yu surekli oku — filter dt dogru calisson diye
+
    static unsigned long lastImuMs = 0;
    if (millis() - lastImuMs >= 10) {   // 100 Hz
      lastImuMs = millis();
      ImuData d = mpuRead();
      if (d.ok) { lastImu = d; cfUpdate(d); }
+   }
+
+   static unsigned long lastCtrlMs = 0;
+   if (millis() - lastCtrlMs >= 50) {  // 20 Hz
+     lastCtrlMs = millis();
+     if (runMode == MODE_AUTO) {
+       // Wall recovery: after 2s in EMERGENCY re-check LiDAR
+       if (autoWallRecover && armState == EMERGENCY) {
+         if (millis() - wallEmergencyMs >= 2000) {
+           if (lunaDistCm > 50) {
+             armState        = ARMED;
+             autoWallRecover = false;
+             lastAutoLog     = "Wall cleared — resumed";
+             Serial.println("[AUTO] Wall cleared — re-ARMED");
+           } else {
+             wallEmergencyMs = millis();  // keep waiting
+           }
+         }
+       } else {
+         autoControl();
+       }
+     } else {
+       manualSafety();
+     }
    }
  }
  

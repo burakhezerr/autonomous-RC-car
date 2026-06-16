@@ -29,8 +29,8 @@ Tam sistem durumu. `status.json` formatıyla config + telemetry.
 ```json
 {
   "config": {
-    "servo": { "minUs": 1700, "neutralUs": 2000, "maxUs": 2300 },
-    "esc":   { "minUs": 1370, "neutralUs": 1470, "maxUs": 1600 }
+    "servo": { "minUs": 1730, "neutralUs": 2030, "maxUs": 2330 },
+    "esc":   { "minUs": 1430, "neutralUs": 1490, "maxUs": 1550 }
   },
   "telemetry": {
     "sonar": {
@@ -181,8 +181,8 @@ Direksiyon (servo) ve gaz (ESC) değeri yazar. **Yalnızca `ARMED` durumunda ça
 
 | Sinyal | Min | Nötr | Max |
 |--------|-----|------|-----|
-| Servo (steer) | 1700 µs (sol) | 2000 µs (düz) | 2300 µs (sağ) |
-| ESC (thr) | 1370 µs (min) | 1470 µs (nötr) | 1600 µs (max) |
+| Servo (steer) | 1730 µs (sol) | 2030 µs (düz) | 2330 µs (sağ) |
+| ESC (thr) | 1430 µs (ileri) | 1490 µs (nötr) | 1550 µs (geri) |
 
 **Sunucu tarafı sınır hesabı:**
 ```
@@ -199,14 +199,14 @@ thr   → [ESC_MIN,  ESC_MID + (ESC_MAX-ESC_MID)*throttleLimitPct/100]
 
 **Örnekler:**
 ```bash
-# Düz, hafif ileri
-curl -X POST "http://esp.local:5000/control?steer=2000&thr=1480"
+# Düz, hafif ileri (1430=tam ileri, 1490=nötr)
+curl -X POST "http://esp.local:5000/control?steer=2030&thr=1460"
 
 # Sola dön, nötr gaz
-curl -X POST "http://esp.local:5000/control?steer=1800"
+curl -X POST "http://esp.local:5000/control?steer=1830"
 
-# Sadece gaz
-curl -X POST "http://esp.local:5000/control?thr=1490"
+# Sadece gaz (tam ileri)
+curl -X POST "http://esp.local:5000/control?thr=1430"
 ```
 
 ---
@@ -288,7 +288,7 @@ def get_status():
         return json.loads(r.read())
 
 post("/arm")
-post("/control?steer=2000&thr=1480")
+post("/control?steer=2030&thr=1460")
 post("/set?thr_limit=35&steer_limit=70")
 post("/disarm")
 ```
