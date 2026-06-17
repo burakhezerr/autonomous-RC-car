@@ -26,6 +26,7 @@
  #include <ESPmDNS.h>
  #include <Wire.h>
  #include <ESP32Servo.h>
+ #include "policy_weights.h"
  
  struct ImuData {
    float ax, ay, az, gx, gy, gz, temp;
@@ -108,6 +109,25 @@
  String lastAutoLog = "";
  bool   autoWallRecover = false;
  unsigned long wallEmergencyMs = 0;
+
+ // --- Auto mode version ---
+ enum AutoVersion { AUTO_SINGLE, AUTO_MULTI };
+ AutoVersion   autoVersion     = AUTO_SINGLE;
+
+ // --- Emergency servo timer ---
+ unsigned long emergencyStartMs = 0;
+
+ // --- RL (ESP32 içi model, sadece AUTO_MULTI'de aktif) ---
+ bool          rlActive         = false;
+ int           rlStrategy       = 0;
+ #define OBSTACLE_RANGE_CM  150
+ #define CLEAR_RANGE_CM     300
+ #define STATIC_THRESHOLD   0.15f
+ #define CLASSIFY_SAMPLES   3
+ float         lunaHist[CLASSIFY_SAMPLES];
+ unsigned long lunaHistMs[CLASSIFY_SAMPLES];
+ int           lunaHistIdx  = 0;
+ bool          lunaHistFull = false;
  
  // ---------------------------------------------------------------------------
  // Arm / E-Stop state machine
@@ -145,10 +165,11 @@
  }
  
  void doEstop() {
-   armState     = EMERGENCY;
-   disarmReason = "emergency_stop";
-   escUs        = ESC_MID_US;
-   servoUs      = SERVO_MID_US;
+   armState        = EMERGENCY;
+   emergencyStartMs = millis();
+   disarmReason    = "emergency_stop";
+   escUs           = ESC_MID_US;
+   servoUs         = SERVO_MID_US;
    esc.writeMicroseconds(ESC_MID_US);
    steerServo.writeMicroseconds(SERVO_MID_US);
    digitalWrite(LED_ARMED, LOW);
@@ -227,12 +248,21 @@
  // ---------------------------------------------------------------------------
  // Autonomous control helpers
  // ---------------------------------------------------------------------------
+ int proxLv1 = 35;
+ int proxLv2 = 60;
+ int proxLv3 = 85;
+ int proxLv4 = 115;
+
+ int lidarStopCm = 50;    // ≤ this → EMERGENCY in auto mode
+ int lidarSlowCm = 100;   // ≤ this → reduced speed in auto mode
+ int sonarCloseCm = 10;   // ≤ this → stop + full steer away (auto & manual)
+
  int proximityLevel(float cm) {
-   if (cm < 0)   return 5;
-   if (cm <= 35) return 1;
-   if (cm <= 60) return 2;
-   if (cm <= 85) return 3;
-   if (cm <= 115) return 4;
+   if (cm < 0)        return 5;
+   if (cm <= proxLv1) return 1;
+   if (cm <= proxLv2) return 2;
+   if (cm <= proxLv3) return 3;
+   if (cm <= proxLv4) return 4;
    return 5;
  }
 
@@ -240,11 +270,12 @@
    if (armState != ARMED) return;
 
    // LiDAR wall detection — takes priority
-   if (lunaDistCm > 0 && lunaDistCm <= 25) {
+   if (lunaDistCm > 0 && lunaDistCm <= lidarStopCm) {
      escUs = ESC_MID_US; servoUs = SERVO_MID_US;
      esc.writeMicroseconds(ESC_MID_US);
      steerServo.writeMicroseconds(SERVO_MID_US);
      armState          = EMERGENCY;
+     emergencyStartMs  = millis();
      disarmReason      = "wall_detected";
      autoWallRecover   = true;
      wallEmergencyMs   = millis();
@@ -254,8 +285,8 @@
    }
 
    // Sonar ≤10cm: stop + full steer away (4-level equivalent)
-   bool leftClose  = (lastLeft  > 0 && lastLeft  <= 10.0f);
-   bool rightClose = (lastRight > 0 && lastRight <= 10.0f);
+   bool leftClose  = (lastLeft  > 0 && lastLeft  <= sonarCloseCm);
+   bool rightClose = (lastRight > 0 && lastRight <= sonarCloseCm);
    if (leftClose || rightClose) {
      escUs = ESC_MID_US;
      esc.writeMicroseconds(ESC_MID_US);
@@ -285,7 +316,7 @@
 
    // LiDAR-based speed: >100cm=max, 25-100cm=medium
    int autoUs;
-   if (lunaDistCm < 0 || lunaDistCm > 100) {
+   if (lunaDistCm < 0 || lunaDistCm > lidarSlowCm) {
      autoUs      = 1560;
      lastAutoLog = "Full speed";
    } else {
@@ -298,8 +329,8 @@
 
  void manualSafety() {
    if (armState != ARMED) return;
-   bool sonarDanger = (lastLeft  >= 0 && lastLeft  <= 10.0f)
-                   || (lastRight >= 0 && lastRight <= 10.0f);
+   bool sonarDanger = (lastLeft  >= 0 && lastLeft  <= sonarCloseCm)
+                   || (lastRight >= 0 && lastRight <= sonarCloseCm);
    bool lidarDanger = (lunaDistCm > 0 && lunaDistCm <= 25);
    if (sonarDanger || lidarDanger) {
      escUs = ESC_MID_US;
@@ -561,6 +592,7 @@
        <button class="btn btn-disarm" id="btn-disarm" onclick="sendDisarm()">DISARM</button>
        <button class="btn btn-estop"  id="btn-estop"  onclick="sendEstop()">E-STOP</button>
        <button class="btn" id="btn-auto" onclick="sendMode()" style="background:#333;color:#aaa">AUTO OFF</button>
+       <button class="btn" id="btn-av" onclick="sendAutoVersion()" style="background:#1a1a2e;color:#555;display:none">SINGLE-CAR</button>
      </div>
      <div id="auto-info" style="display:none;margin-top:10px">
        <div class="grid2">
@@ -569,6 +601,7 @@
        </div>
        <div style="font-size:10px;color:#555;margin-top:6px;text-align:center">Lv1≤45 · Lv2≤60 · Lv3≤75 · Lv4≤95 · sonar≤10cm→stop+steer · LiDAR≤25cm→EMERGENCY · LiDAR>100cm→full</div>
        <div id="auto-log" style="margin-top:8px;padding:6px 10px;background:#111;border:1px solid #333;border-radius:6px;font-size:12px;color:#00e676;font-family:monospace;min-height:24px;text-align:center">—</div>
+       <div id="rl-badge" style="display:none;margin-top:6px;padding:4px 10px;background:#4a0080;border-radius:6px;font-size:11px;color:#ce93d8;font-family:monospace;text-align:center">RL ACTIVE</div>
      </div>
      <div class="slider-row">
        <div class="slider-lbl">Steering (µs)</div>
@@ -610,6 +643,7 @@
      setTile('val-r','box-r', d.right, 1, v=>v<20);
      drawProx('prox-l', d.lLv);
      drawProx('prox-r', d.rLv);
+     if(d.mstate && d.mstate !== currentState) updateStateBadge(d.mstate);
      if(autoMode){
        const lvlColor=v=>v<=2;
        const el=document.getElementById('lv-l');
@@ -619,7 +653,10 @@
        const al=document.getElementById('auto-log');
        if(al&&d.alog!=null){
          al.textContent=d.alog||'—';
-         al.style.color=d.alog==='Wall detected'?'#ff1744':d.alog.startsWith('Wall cleared')?'#69f0ae':'#00e676';
+         const isRL=d.alog.startsWith('RL:');
+         al.style.color=d.alog==='Wall detected'?'#ff1744':d.alog.startsWith('Wall cleared')?'#69f0ae':isRL?'#ce93d8':'#00e676';
+         const rb=document.getElementById('rl-badge');
+         if(rb) rb.style.display=(isRL&&autoVersionMode==='multi')?'block':'none';
        }
      }
  
@@ -639,6 +676,7 @@
  let currentState = 'DISARMED';
  let neutralSteer = 2040, neutralThr = 1540;
  let autoMode = false;
+ let autoVersionMode = 'single';
  function updateStateBadge(state){
    currentState = state;
    const b = document.getElementById('state-badge');
@@ -674,7 +712,7 @@
  let _ctrlTimer = null;
  function scheduleControl(){
    if(_ctrlTimer) return;
-   _ctrlTimer = setTimeout(()=>{ _ctrlTimer=null; sendControl(); }, 80);
+   _ctrlTimer = setTimeout(()=>{ _ctrlTimer=null; sendControl(); }, 150);
  }
  
  async function sendArm(){
@@ -696,6 +734,26 @@
        document.getElementById('sl-thr').value=neutralThr;     thrVal(neutralThr); }
    } catch(e){ alert('E-STOP error'); }
  }
+ function updateAvBtn(){
+   const b=document.getElementById('btn-av');
+   if(!b) return;
+   const isMulti = autoVersionMode==='multi';
+   b.textContent = isMulti ? 'MULTI-CAR' : 'SINGLE-CAR';
+   b.style.background = isMulti ? '#6a0dad' : '#1a1a2e';
+   b.style.color = isMulti ? '#ce93d8' : '#7986cb';
+   b.style.display = autoMode ? 'inline-block' : 'none';
+ }
+ async function sendAutoVersion(){
+   const next = autoVersionMode==='single' ? 'multi' : 'single';
+   try{
+     const r=await fetch('/auto-version?version='+next,{method:'POST'}); const d=await r.json();
+     if(d.ok){
+       autoVersionMode = next;
+       updateAvBtn();
+       if(next==='single'){ document.getElementById('rl-badge').style.display='none'; }
+     }
+   } catch(e){ alert('Auto version error'); }
+ }
  async function sendMode(){
    const next = autoMode ? 'manual' : 'auto';
    try{
@@ -707,6 +765,8 @@
        b.style.background=autoMode?'#00c853':'#333';
        b.style.color=autoMode?'#000':'#aaa';
        document.getElementById('auto-info').style.display=autoMode?'block':'none';
+       if(!autoMode){ document.getElementById('rl-badge').style.display='none'; }
+       updateAvBtn();
        if(autoMode && gpOn) toggleGp();
        updateStateBadge(currentState);
      }
@@ -935,6 +995,59 @@ const char OPENAPI_JSON[] PROGMEM = R"rawliteral(
         "responses":{"200":{"description":"E-STOP active","content":{"application/json":{"example":{"ok":true,"state":"EMERGENCY"}}}}}
       }
     },
+    "/mode":{
+      "post":{
+        "tags":["Control"],
+        "summary":"Set run mode",
+        "description":"Switch between AUTO and MANUAL mode.",
+        "parameters":[{"name":"mode","in":"query","required":true,"schema":{"type":"string","enum":["auto","manual"]}}],
+        "responses":{"200":{"description":"Mode changed","content":{"application/json":{"example":{"ok":true,"mode":"AUTO"}}}}}
+      }
+    },
+    "/auto-version":{
+      "post":{
+        "tags":["Control"],
+        "summary":"Set auto mode version",
+        "description":"Switch between single-car (ultrasonics+LiDAR only) and multi-car (RL enabled) autonomous modes.",
+        "parameters":[{"name":"version","in":"query","required":true,"schema":{"type":"string","enum":["single","multi"]}}],
+        "responses":{"200":{"description":"Version changed","content":{"application/json":{"example":{"ok":true,"autoVersion":"multi-car"}}}}}
+      }
+    },
+    "/set-prox":{
+      "post":{
+        "tags":["Config"],
+        "summary":"Update sonar proximity thresholds",
+        "description":"Updates all 5 sonar thresholds at once. Only allowed when DISARMED and in MANUAL mode. Rules: close>=10, lv1>=25, each consecutive level must have >=20cm gap.",
+        "parameters":[
+          {"name":"lv1","in":"query","required":true,"description":"Level 1 upper bound (cm, min 25)","schema":{"type":"integer","example":35}},
+          {"name":"lv2","in":"query","required":true,"description":"Level 2 upper bound (cm, min lv1+20)","schema":{"type":"integer","example":60}},
+          {"name":"lv3","in":"query","required":true,"description":"Level 3 upper bound (cm, min lv2+20)","schema":{"type":"integer","example":85}},
+          {"name":"lv4","in":"query","required":true,"description":"Level 4 upper bound (cm, min lv3+20)","schema":{"type":"integer","example":115}},
+          {"name":"close","in":"query","required":true,"description":"Emergency stop+steer threshold (cm, min 10)","schema":{"type":"integer","example":10}}
+        ],
+        "responses":{
+          "200":{"description":"Thresholds updated","content":{"application/json":{"example":{"ok":true,"proxThresholds":{"lv1":35,"lv2":60,"lv3":85,"lv4":115,"close":10}}}}},
+          "400":{"description":"Validation error","content":{"application/json":{"example":{"ok":false,"msg":"Each consecutive level must have >= 20 cm gap"}}}},
+          "403":{"description":"ARMED or AUTO mode","content":{"application/json":{"example":{"ok":false,"msg":"Cannot change thresholds while ARMED"}}}}
+        }
+      }
+    },
+    "/set-lidar":{
+      "post":{
+        "tags":["Config"],
+        "summary":"Update LiDAR thresholds",
+        "description":"Updates LiDAR stop and slow thresholds. Only allowed when DISARMED and in MANUAL mode. Rules: stop>=40, slow>=stop*2.",
+        "parameters":[
+          {"name":"stop","in":"query","required":true,"description":"EMERGENCY trigger distance (cm, min 40)","schema":{"type":"integer","example":50}},
+          {"name":"slow","in":"query","required":true,"description":"Reduced speed threshold (cm, min stop*2)","schema":{"type":"integer","example":100}}
+        ],
+        "responses":{
+          "200":{"description":"Thresholds updated","content":{"application/json":{"example":{"ok":true,"lidarThresholds":{"stop":50,"slow":100}}}}},
+          "400":{"description":"Validation error","content":{"application/json":{"example":{"ok":false,"msg":"slow must be >= 2x stop (min 100 cm)"}}}},
+          "403":{"description":"ARMED or AUTO mode","content":{"application/json":{"example":{"ok":false,"msg":"Cannot change thresholds in AUTO mode"}}}}
+        }
+      }
+    },
     "/control":{
       "post":{
         "tags":["Control"],
@@ -1013,24 +1126,26 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    float l = lastLeft, r = lastRight;
    ImuData imu = lastImu;
    int lvL = proximityLevel(l), lvR = proximityLevel(r);
-   char buf[384];
+   const char* mstate = (armState == ARMED) ? "ARMED"
+                      : (armState == EMERGENCY) ? "EMERGENCY" : "DISARMED";
+   char buf[420];
    if (imu.ok) {
      snprintf(buf, sizeof(buf),
        "{\"left\":%.1f,\"right\":%.1f,\"lLv\":%d,\"rLv\":%d,"
        "\"luna\":%d,\"lstr\":%d,\"ltmp\":%.1f,"
        "\"imu_ok\":true,\"ax\":%.3f,\"ay\":%.3f,\"az\":%.3f,"
        "\"gx\":%.2f,\"gy\":%.2f,\"gz\":%.2f,\"temp\":%.1f,"
-       "\"alog\":\"%s\"}",
+       "\"alog\":\"%s\",\"mstate\":\"%s\"}",
        l, r, lvL, lvR, lunaDistCm, lunaStr, lunaTemp,
        imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz, imu.temp,
-       lastAutoLog.c_str());
+       lastAutoLog.c_str(), mstate);
    } else {
      snprintf(buf, sizeof(buf),
        "{\"left\":%.1f,\"right\":%.1f,\"lLv\":%d,\"rLv\":%d,"
        "\"luna\":%d,\"lstr\":%d,\"ltmp\":%.1f,\"imu_ok\":false,"
-       "\"alog\":\"%s\"}",
+       "\"alog\":\"%s\",\"mstate\":\"%s\"}",
        l, r, lvL, lvR, lunaDistCm, lunaStr, lunaTemp,
-       lastAutoLog.c_str());
+       lastAutoLog.c_str(), mstate);
    }
    addCORS();
    server.send(200, "application/json", buf);
@@ -1059,26 +1174,31 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    j += "\"telemetry\":{";
  
    // sonar
-   char buf[512];
+   char buf[768];
    snprintf(buf, sizeof(buf),
      "\"sonar\":{"
        "\"lCm\":%.1f,\"rCm\":%.1f,"
        "\"lLv\":%d,\"rLv\":%d,"
        "\"lFwd\":%.1f,\"lLat\":%.1f,"
        "\"rFwd\":%.1f,\"rLat\":%.1f,"
-       "\"angle\":%.1f"
+       "\"angle\":%.1f,"
+       "\"thresholds\":{\"close\":%d,\"lv1\":%d,\"lv2\":%d,\"lv3\":%d,\"lv4\":%d}"
      "},",
      lastLeft, lastRight,
      proxLv(lastLeft), proxLv(lastRight),
      lFwd, lLat, rFwd, rLat,
-     SONAR_ANGLE_DEG);
+     SONAR_ANGLE_DEG,
+     sonarCloseCm, proxLv1, proxLv2, proxLv3, proxLv4);
    j += buf;
- 
+
    // lidar
    snprintf(buf, sizeof(buf),
-     "\"lidar\":{\"ok\":%s,\"cm\":%.1f},",
+     "\"lidar\":{\"ok\":%s,\"cm\":%.1f,"
+       "\"thresholds\":{\"stop\":%d,\"slow\":%d}"
+     "},",
      lidarOk ? "true" : "false",
-     (float)lunaDistCm);
+     (float)lunaDistCm,
+     lidarStopCm, lidarSlowCm);
    j += buf;
  
    // imu
@@ -1123,15 +1243,18 @@ void handleOpenApi() { addCORS(); server.send(200, "application/json", OPENAPI_J
    {
      const char* mstate = (armState == ARMED) ? "ARMED"
                         : (armState == EMERGENCY) ? "EMERGENCY" : "DISARMED";
-     char sbuf[128];
+     char sbuf[256];
      snprintf(sbuf, sizeof(sbuf),
        "\"system\":{\"mstate\":\"%s\",\"armPct\":%d,"
        "\"disarmReason\":\"%s\",\"mode\":\"%s\","
+       "\"auto-mode-enabled\":%s,\"auto-mode-status\":\"%s\","
        "\"emergency\":%s},",
        mstate,
        armState == ARMED ? 100 : 0,
        disarmReason.c_str(),
        runMode == MODE_AUTO ? "AUTO" : "MANUAL",
+       runMode == MODE_AUTO ? "true" : "false",
+       autoVersion == AUTO_MULTI ? "multi-car" : "single-car",
        armState == EMERGENCY ? "true" : "false");
      j += sbuf;
    }
@@ -1238,6 +1361,122 @@ void handleSet() {
   server.send(200, "application/json", buf);
 }
 
+ // POST /set-prox?lv1=35&lv2=60&lv3=85&lv4=115&close=10
+ void handleSetProx() {
+   addCORS();
+   if (runMode == MODE_AUTO) {
+     server.send(403, "application/json",
+       "{\"ok\":false,\"msg\":\"Cannot change thresholds in AUTO mode\"}");
+     return;
+   }
+   if (armState == ARMED) {
+     server.send(403, "application/json",
+       "{\"ok\":false,\"msg\":\"Cannot change thresholds while ARMED\"}");
+     return;
+   }
+   if (!server.hasArg("lv1") || !server.hasArg("lv2") ||
+       !server.hasArg("lv3") || !server.hasArg("lv4") || !server.hasArg("close")) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"All params required: lv1, lv2, lv3, lv4, close\"}");
+     return;
+   }
+   int v1    = server.arg("lv1").toInt();
+   int v2    = server.arg("lv2").toInt();
+   int v3    = server.arg("lv3").toInt();
+   int v4    = server.arg("lv4").toInt();
+   int close = server.arg("close").toInt();
+   if (close < 10) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"close must be >= 10 cm\"}");
+     return;
+   }
+   if (v1 < 25) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"lv1 must be >= 25 cm\"}");
+     return;
+   }
+   if (v2 - v1 < 20 || v3 - v2 < 20 || v4 - v3 < 20) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"Each consecutive level must have >= 20 cm gap (lv1<lv2<lv3<lv4)\"}");
+     return;
+   }
+   proxLv1      = v1;
+   proxLv2      = v2;
+   proxLv3      = v3;
+   proxLv4      = v4;
+   sonarCloseCm = close;
+   Serial.printf("[SET-PROX] lv1=%d lv2=%d lv3=%d lv4=%d close=%d\n", v1, v2, v3, v4, close);
+   char buf[128];
+   snprintf(buf, sizeof(buf),
+     "{\"ok\":true,\"proxThresholds\":{\"lv1\":%d,\"lv2\":%d,\"lv3\":%d,\"lv4\":%d,\"close\":%d}}",
+     proxLv1, proxLv2, proxLv3, proxLv4, sonarCloseCm);
+   server.send(200, "application/json", buf);
+ }
+
+ // POST /set-lidar?stop=50&slow=100
+ void handleSetLidar() {
+   addCORS();
+   if (runMode == MODE_AUTO) {
+     server.send(403, "application/json",
+       "{\"ok\":false,\"msg\":\"Cannot change thresholds in AUTO mode\"}");
+     return;
+   }
+   if (armState == ARMED) {
+     server.send(403, "application/json",
+       "{\"ok\":false,\"msg\":\"Cannot change thresholds while ARMED\"}");
+     return;
+   }
+   if (!server.hasArg("stop") || !server.hasArg("slow")) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"Both params required: stop, slow\"}");
+     return;
+   }
+   int vstop = server.arg("stop").toInt();
+   int vslow = server.arg("slow").toInt();
+   if (vstop < 40) {
+     server.send(400, "application/json",
+       "{\"ok\":false,\"msg\":\"stop must be >= 40 cm\"}");
+     return;
+   }
+   if (vslow < vstop * 2) {
+     char buf[96];
+     snprintf(buf, sizeof(buf),
+       "{\"ok\":false,\"msg\":\"slow must be >= 2x stop (min %d cm)\"}",
+       vstop * 2);
+     server.send(400, "application/json", buf);
+     return;
+   }
+   lidarStopCm = vstop;
+   lidarSlowCm = vslow;
+   Serial.printf("[SET-LIDAR] stop=%d slow=%d\n", vstop, vslow);
+   char buf[80];
+   snprintf(buf, sizeof(buf),
+     "{\"ok\":true,\"lidarThresholds\":{\"stop\":%d,\"slow\":%d}}",
+     lidarStopCm, lidarSlowCm);
+   server.send(200, "application/json", buf);
+ }
+
+ void handleAutoVersion() {
+   addCORS();
+   if (!server.hasArg("version")) {
+     server.send(400, "application/json", "{\"ok\":false,\"msg\":\"no version param\"}");
+     return;
+   }
+   String v = server.arg("version");
+   if (v == "multi") {
+     autoVersion = AUTO_MULTI;
+   } else {
+     autoVersion  = AUTO_SINGLE;
+     rlActive     = false;
+     lunaHistIdx  = 0;
+     lunaHistFull = false;
+   }
+   const char* vstr = (autoVersion == AUTO_MULTI) ? "multi-car" : "single-car";
+   char buf[64];
+   snprintf(buf, sizeof(buf), "{\"ok\":true,\"autoVersion\":\"%s\"}", vstr);
+   server.send(200, "application/json", buf);
+ }
+
  void handleMode() {
    addCORS();
    if (!server.hasArg("mode")) {
@@ -1262,6 +1501,67 @@ void handleSet() {
    String resp = String("{\"ok\":true,\"mode\":\"") + (runMode == MODE_AUTO ? "AUTO" : "MANUAL") + "\"}";
    server.send(200, "application/json", resp);
  }
+
+// LiDAR geçmişini güncelle
+void updateLunaHistory() {
+  lunaHist[lunaHistIdx]   = lunaDistCm / 100.0f;
+  lunaHistMs[lunaHistIdx] = millis();
+  lunaHistIdx = (lunaHistIdx + 1) % CLASSIFY_SAMPLES;
+  if (lunaHistIdx == 0) lunaHistFull = true;
+}
+
+void resetLunaHistory() {
+  lunaHistIdx  = 0;
+  lunaHistFull = false;
+}
+
+// Kapanma hızı oranına göre statik/dinamik karar
+bool isDynamic() {
+  if (!lunaHistFull) return false;
+  int oldest = lunaHistIdx;  // en eski kayıt (dairesel buffer)
+  float d0 = lunaHist[oldest];
+  float d1 = lunaHist[(oldest + CLASSIFY_SAMPLES - 1) % CLASSIFY_SAMPLES];
+  float dt  = (lunaHistMs[(oldest + CLASSIFY_SAMPLES - 1) % CLASSIFY_SAMPLES]
+              - lunaHistMs[oldest]) / 1000.0f;
+  if (dt < 0.05f) return false;
+  float closingRate = (d0 - d1) / dt;
+  float speedEst    = max((escUs - 1495) / 65.0f * 1.16f, 0.15f);
+  return (closingRate / speedEst) < STATIC_THRESHOLD;
+}
+
+// RL stratejisini motora uygula
+void applyRLStrategy() {
+  int targetEsc = (rlStrategy == 0) ? ESC_MID_US : 1557;
+  if (lunaDistCm > 0 && lunaDistCm < 40) targetEsc = ESC_MID_US;  // güvenlik
+  int targetServo = SERVO_MID_US;
+  if (rlStrategy == 2) targetServo = SERVO_MID_US - 80;  // sol
+  if (rlStrategy == 3) targetServo = SERVO_MID_US + 80;  // sağ
+  escUs   = targetEsc;
+  servoUs = targetServo;
+  esc.writeMicroseconds(escUs);
+  steerServo.writeMicroseconds(servoUs);
+  const char* names[] = {"TEMKIN","NORMAL","SOL GEC","SAG GEC"};
+  lastAutoLog = String("RL:") + names[rlStrategy];
+}
+
+void handleSensors() {
+  addCORS();
+  char buf[96];
+  snprintf(buf, sizeof(buf),
+    "{\"luna\":%d,\"lstr\":%d,\"left\":%.1f,\"right\":%.1f,\"esc\":%d}",
+    lunaDistCm, lunaStr, lastLeft, lastRight, escUs);
+  server.send(200, "application/json", buf);
+}
+
+// GET /rl — mevcut RL durumunu döner (debug)
+void handleRL() {
+  addCORS();
+  char buf[80];
+  snprintf(buf, sizeof(buf),
+    "{\"rlActive\":%s,\"strategy\":%d,\"luna\":%d}",
+    rlActive ? "true" : "false", rlStrategy, lunaDistCm);
+  server.send(200, "application/json", buf);
+}
 
 void handleNotFound() { server.send(404, "text/plain", "Not found"); }
  
@@ -1332,10 +1632,17 @@ void handleNotFound() { server.send(404, "text/plain", "Not found"); }
    server.on("/estop",   HTTP_OPTIONS, handleOptions);
    server.on("/control", HTTP_POST,    handleControl);
    server.on("/control", HTTP_OPTIONS, handleOptions);
-   server.on("/set",     HTTP_POST,    handleSet);
-   server.on("/set",     HTTP_OPTIONS, handleOptions);
-   server.on("/mode",    HTTP_POST,    handleMode);
-   server.on("/mode",    HTTP_OPTIONS, handleOptions);
+   server.on("/set",       HTTP_POST,    handleSet);
+   server.on("/set",       HTTP_OPTIONS, handleOptions);
+   server.on("/set-prox",  HTTP_POST,    handleSetProx);
+   server.on("/set-prox",  HTTP_OPTIONS, handleOptions);
+   server.on("/set-lidar", HTTP_POST,    handleSetLidar);
+   server.on("/set-lidar", HTTP_OPTIONS, handleOptions);
+   server.on("/mode",         HTTP_POST,    handleMode);
+   server.on("/mode",         HTTP_OPTIONS, handleOptions);
+   server.on("/auto-version", HTTP_POST,    handleAutoVersion);
+   server.on("/sensors",      HTTP_GET,     handleSensors);
+   server.on("/rl",           HTTP_GET,     handleRL);
    server.onNotFound(handleNotFound);
    server.begin();
    Serial.println("http://esp.local:5000");
@@ -1360,24 +1667,70 @@ void handleNotFound() { server.send(404, "text/plain", "Not found"); }
    if (millis() - lastCtrlMs >= 50) {  // 20 Hz
      lastCtrlMs = millis();
      if (runMode == MODE_AUTO) {
-       // Wall recovery: after 2s in EMERGENCY re-check LiDAR
-       if (autoWallRecover && armState == EMERGENCY) {
-         if (millis() - wallEmergencyMs >= 2000) {
+       if (armState == DISARMED) {
+         // DISARMED: her zaman neutral
+         escUs   = ESC_MID_US;
+         servoUs = SERVO_MID_US;
+         esc.writeMicroseconds(ESC_MID_US);
+         steerServo.writeMicroseconds(SERVO_MID_US);
+       } else if (armState == EMERGENCY) {
+         // ESC her zaman neutral
+         escUs = ESC_MID_US;
+         esc.writeMicroseconds(ESC_MID_US);
+         // Servo: ilk 1s manevra için serbest, sonra neutral
+         if (millis() - emergencyStartMs >= 1000) {
+           servoUs = SERVO_MID_US;
+           steerServo.writeMicroseconds(SERVO_MID_US);
+         }
+         // Wall recovery
+         if (autoWallRecover && millis() - wallEmergencyMs >= 2000) {
            if (lunaDistCm > 50) {
              armState        = ARMED;
              autoWallRecover = false;
              lastAutoLog     = "Wall cleared — resumed";
              Serial.println("[AUTO] Wall cleared — re-ARMED");
            } else {
-             wallEmergencyMs = millis();  // keep waiting
+             wallEmergencyMs = millis();
            }
          }
        } else {
-         autoControl();
+         // ARMED: single-car veya multi-car
+         if (autoVersion == AUTO_MULTI) {
+           if (lunaDistCm > 0 && lunaDistCm < OBSTACLE_RANGE_CM) {
+             updateLunaHistory();
+             if (isDynamic()) {
+               float obs[7];
+               obs[0] = max((escUs - 1495) / 65.0f * 1.16f, 0.0f);
+               obs[1] = lunaDistCm / 100.0f;
+               obs[2] = lastLeft  > 0 ? lastLeft  / 100.0f : 1.5f;
+               obs[3] = lastRight > 0 ? lastRight / 100.0f : 1.5f;
+               obs[4] = 0.0f;
+               obs[5] = lastImu.ok ? lastImu.gz : 0.0f;
+               obs[6] = 5.0f;
+               float probs[NUM_STRATEGIES];
+               policy_forward(obs, probs);
+               rlStrategy = policy_argmax(probs);
+               rlActive   = true;
+             } else {
+               rlActive = false;
+             }
+           } else {
+             resetLunaHistory();
+             rlActive = false;
+           }
+           if (rlActive) {
+             applyRLStrategy();
+           } else {
+             autoControl();
+           }
+         } else {
+           // AUTO_SINGLE: sadece orijinal autoControl
+           rlActive = false;
+           autoControl();
+         }
        }
      } else {
        manualSafety();
      }
    }
  }
- 

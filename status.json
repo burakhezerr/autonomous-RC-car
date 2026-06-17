@@ -1,78 +1,96 @@
 {
     "config": {
       "servo": {
-        // min-max µs değerleri servo kalibrasyonu için
-        "minUs": 1000,      // sol/max steering
-        "neutralUs": 1500,  // merkez (0°)
-        "maxUs": 2000       // sağ/max steering
+        // Servo PWM calibration values — must match SERVO_MIN/MID/MAX_US #define
+        "minUs": 1820,      // full left steering
+        "neutralUs": 2040,  // center (straight)
+        "maxUs": 2260       // full right steering
       },
       "esc": {
-        // min-max µs değerleri ESC kalibrasyonu için
-        "minUs": 1000,      // geri/durdurma
-        "neutralUs": 1500,  // neutral (0%)
-        "maxUs": 2000       // ileri/max throttle
+        // ESC PWM calibration values — must match ESC_MIN/MID/MAX_US #define
+        "minUs": 1430,      // full forward
+        "neutralUs": 1495,  // neutral (stop)
+        "maxUs": 1560       // full reverse
       }
     },
     "telemetry": {
       "sonar": {
-        "lCm": 45.2,        // sonar sol: ölçülen ham mesafe (hipotenüs), cm
-        "rCm": 38.7,        // sonar sağ: ölçülen ham mesafe (hipotenüs), cm
-        "lLv": 2,           // sol prox seviyesi 0-4
-        "rLv": 1,           // sağ prox seviyesi 0-4
-        // Prox seviyesi: Yakınlık sensörü seviyesidir - sonar ile ölçülen mesafeye göre 0-4 arasında kategorize edilen uyarı seviyesi:
-        "lFwd": 32.0,       // sol sensör: ileri yansıması (lCm × cos α), cm
-        "lLat": 32.0,       // sol sensör: yanal clearance (lCm × sin α), cm
-        "rFwd": 27.4,       // sağ sensör: ileri yansıması (rCm × cos α), cm
-        "rLat": 27.4,       // sağ sensör: yanal clearance (rCm × sin α), cm
-        "angle": 45.0       // montaj açısı, derece
+        "lCm": 36.4,        // left sonar: raw distance (hypotenuse), cm
+        "rCm": 66.4,        // right sonar: raw distance (hypotenuse), cm
+        "lLv": 2,           // left proximity level (1=critical ... 5=clear)
+        "rLv": 3,           // right proximity level (1=critical ... 5=clear)
+        // Proximity levels are computed from thresholds below — changeable via POST /set-prox
+        "lFwd": 31.5,       // left sensor forward component (lCm × cos α), cm
+        "lLat": 18.2,       // left sensor lateral component (lCm × sin α), cm
+        "rFwd": 57.5,       // right sensor forward component (rCm × cos α), cm
+        "rLat": 33.2,       // right sensor lateral component (rCm × sin α), cm
+        "angle": 30.0,      // sensor mount angle, degrees
+        "thresholds": {
+          // Active threshold values — changeable at runtime via POST /set-prox (DISARMED + MANUAL only)
+          "close": 20,      // <= this → emergency stop + full steer away (sonarCloseCm)
+          "lv1": 35,        // <= this → Level 1, critical danger (proxLv1)
+          "lv2": 60,        // <= this → Level 2, close (proxLv2)
+          "lv3": 85,        // <= this → Level 3, moderate (proxLv3)
+          "lv4": 115        // <= this → Level 4, safe approach (proxLv4)
+        }
       },
       "lidar": {
-        "ok": false,        // TF-Luna UART'tan veri geliyor mu
-        "cm": -1.0          // TF-Luna ileri mesafesi, cm (-1 = yok/hata)
+        "ok": true,         // TF-Luna UART data arriving
+        "cm": 70,           // TF-Luna measured distance, cm (-1 = invalid/error)
+        "thresholds": {
+          // Active threshold values — changeable at runtime via POST /set-lidar (DISARMED + MANUAL only)
+          "stop": 50,       // <= this → EMERGENCY (lidarStopCm)
+          "slow": 100       // <= this → reduced speed; above this → full speed (lidarSlowCm)
+        }
       },
       "imu": {
-        "ok": true,         // MPU6050 init başarılı mı
-        "calibrated": true, // gyro kalibrasyon tamamlandı mı
-        "ax": 0.012,        // ivme X, m/s²
-        "ay": -0.034,       // ivme Y, m/s²
-        "az": 9.810,        // ivme Z, m/s²
-        "gx": 0.010,        // açısal hız X, deg/s
-        "gy": -0.020,       // açısal hız Y, deg/s
-        "gz": 0.000,        // açısal hız Z, deg/s
-        "roll": 1.20,       // tamamlayıcı filtre çıkışı, derece, roll > 0 → sağ taraf aşağı
-        "pitch": -0.50,     // tamamlayıcı filtre çıkışı, derece, pitch > 0 → burun yukarı
-        "yaw": 45.30,       // tamamlayıcı filtre çıkışı, derece, yaw → saat yönü = pozitif (sağa dönüş)
-        "temp": 32.1        // MPU6050 sıcaklık sensörü, °C
+        "ok": false,        // MPU6050 init successful
+        "calibrated": false,// gyro calibration complete (waits ~1.2s at startup, 300 samples)
+        "ax": null,         // acceleration X, g
+        "ay": null,         // acceleration Y, g
+        "az": null,         // acceleration Z, g  (≈ +1g on flat ground)
+        "gx": null,         // angular velocity X, deg/s
+        "gy": null,         // angular velocity Y, deg/s
+        "gz": null,         // angular velocity Z, deg/s
+        "roll": null,       // complementary filter output, deg (right side down = positive)
+        "pitch": null,      // complementary filter output, deg (nose up = positive)
+        "yaw": null,        // complementary filter output, deg (clockwise = positive)
+        "temp": null        // MPU6050 internal temperature, °C
       },
       "odometry": {
-        "x": 0.142,         // dead-reckoning konum X, m
-        "y": -0.037         // dead-reckoning konum Y, m
+        // Dead-reckoning — encoder + IMU integration (Phase 4+)
+        "x": null,          // position X, m
+        "y": null           // position Y, m
       },
       "control": {
-        "steer": 1.23,      // hesaplanan direksiyon açısı, derece
-        "steerPct": 0,      // direksiyon yüzdesi (-100…+100)
-        "servoUs": 2500,    // servo'ya yazılan µs
-        "thrPct": 0,        // gaz yüzdesi (0…100)
-        "escUs": 1500       // ESC'ye yazılan µs
+        "steer": null,      // computed steering angle, degrees
+        "steerPct": 0,      // steering percentage (-100...+100)
+        "servoUs": 2040,    // microseconds written to servo (starts at neutralUs)
+        "thrPct": 50,       // throttle percentage (0...100)
+        "escUs": 1495       // microseconds written to ESC (starts at neutralUs)
       },
       "battery": {
-        "v": 7.80,          // pil voltajı, V
-        "pct": 57           // pil doluluk yüzdesi 0-100
+        // Battery ADC — measured via voltage divider (Phase 3+; CONFIRM: measure actual VDIV_RATIO)
+        "v": null,          // battery voltage, V
+        "pct": null         // battery charge percentage, 0-100
       },
       "system": {
-        "mstate": "ARMED",        // motor durumu
-        "armPct": 100,            // arming ilerleme %
-        "disarmReason": "none",   // son disarm sebebi
-        "mode": "AUTO",           // sürüş modu
-        "emergency": false        // acil durum bayrağı
+        "mstate": "DISARMED",          // ARM state: DISARMED | ARMED | EMERGENCY
+        "armPct": 0,                   // arming progress % (currently 0 or 100)
+        "disarmReason": "web_manual",  // last disarm reason: none | btn_manual | web_manual | emergency_stop | wall_detected
+        "mode": "MANUAL",              // drive mode: MANUAL | AUTO
+        "auto-mode-enabled": false,    // AUTO mode active
+        "auto-mode-status": "single-car", // auto version: single-car | multi-car
+        "emergency": false             // emergency flag
       },
       "wireless": {
-        "wifiOk": true,     // WiFi bağlı mı
-        "rssi": -62         // WiFi sinyal gücü, dBm
+        "wifiOk": true,     // WiFi connected
+        "rssi": -42         // WiFi signal strength, dBm (>= -70 = usable)
       },
       "limits": {
-        "throttleLimit": 40, // throttle limit %
-        "autoThrottle": 30   // auto throttle %
+        // Runtime limit values — changeable via POST /set
+        "throttleLimit": 100, // throttle limit % (100 = full ESC range)
+        "autoThrottle": 20    // auto mode fixed throttle % (reserved, not yet used)
       }
     }
   }

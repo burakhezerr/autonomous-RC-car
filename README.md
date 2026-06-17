@@ -1,36 +1,30 @@
 # ArduinoIDE — ESP32-S3 Onboard Code
 
-Onboard ESP32-S3 firmware for the autonomous RC car. Code lives in `ESP32Code/RC-Car.ino`.
+Onboard ESP32-S3 firmware for the autonomous RC car. Main sketch: `ESP32Code/ESP32Code.ino`.
 
 ```
 ArduinoIDE/
-├── README.md          (this file — toolchain setup)
+├── README.md              (this file — toolchain setup)
+├── status.json            (telemetry format reference with comments)
+├── session.md             (REST API integration guide)
 ├── ESP32Code/
-│   ├── RC-Car.ino     — main sketch
-│   ├── README.md      — pins, PWM values, API reference
-│   └── swagger.md     — full REST API documentation
-└── status.json        — telemetry format reference
+│   ├── ESP32Code.ino      — main sketch (manual + auto mode)
+│   ├── README.md          — pins, PWM values, API reference
+│   └── swagger.md         — full REST API documentation
+└── ESP32Code-Yusuf/
+    └── ESP32Code-Yusuf.ino — multi-car variant with RL policy
 ```
 
 ---
 
 ## arduino-cli
 
-Official docs: [https://arduino.github.io/arduino-cli/](https://arduino.github.io/arduino-cli/)
-
 ### Installation
 
-**macOS (Homebrew — recommended):**
+**macOS (Homebrew):**
 
 ```bash
 brew install arduino-cli
-```
-
-**macOS (manual):**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-sudo mv bin/arduino-cli /usr/local/bin/
 ```
 
 **Windows (winget):**
@@ -38,12 +32,6 @@ sudo mv bin/arduino-cli /usr/local/bin/
 ```powershell
 winget install ArduinoSA.arduino-cli
 ```
-
-**Windows (manual):**
-
-1. Go to [https://arduino.github.io/arduino-cli/](https://arduino.github.io/arduino-cli/) → Installation → download the Windows ZIP
-2. Extract `arduino-cli.exe` to a folder, e.g. `C:\tools\arduino-cli\`
-3. Add that folder to PATH: Start → "Environment Variables" → `Path` → Edit → New → paste the path
 
 Verify:
 
@@ -83,8 +71,6 @@ arduino-cli core list
 
 ## Finding the Port
 
-You need the port before uploading.
-
 **macOS:**
 
 ```bash
@@ -93,7 +79,7 @@ ls /dev/cu.*
 arduino-cli board list
 ```
 
-ESP32-S3 with CDC-on-boot enabled typically appears as `/dev/cu.usbmodem1101` (the number varies).
+ESP32-S3 with CDC-on-boot enabled typically appears as `/dev/cu.usbmodem1101`.
 
 **Windows:**
 
@@ -102,18 +88,14 @@ arduino-cli board list
 # or: Device Manager → Ports (COM & LPT)
 ```
 
-Shows as `COM3`, `COM4`, etc.
-
-> If nothing appears: use a data-capable USB cable (not charge-only). Hold the BOOT button during upload if the port disappears.
+> If nothing appears: use a data-capable USB cable. Hold the BOOT button during upload if the port disappears.
 
 ---
 
 ## Compile & Upload
 
-Replace the port with your actual value from above.
-
 ```bash
-# Compile
+# Compile only
 arduino-cli compile \
   --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" \
   ESP32Code/
@@ -130,12 +112,6 @@ arduino-cli compile --upload \
   --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" \
   ESP32Code/
 
-# Windows port example
-arduino-cli compile --upload \
-  -p COM4 \
-  --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" \
-  ESP32Code/
-
 # Serial monitor (115200 baud)
 arduino-cli monitor -p /dev/cu.usbmodem1101 --config baudrate=115200
 ```
@@ -144,9 +120,9 @@ arduino-cli monitor -p /dev/cu.usbmodem1101 --config baudrate=115200
 
 | Flag | Meaning |
 |------|---------|
-| `--fqbn esp32:esp32:esp32s3` | Fully Qualified Board Name — Espressif core, ESP32 family, S3 variant |
-| `CDCOnBoot=cdc` | Enables USB-Serial via built-in CDC — required for Serial Monitor without a separate USB-UART chip |
-| `-p /dev/cu.usbmodem1101` | Serial port the board is on |
+| `--fqbn esp32:esp32:esp32s3` | Fully Qualified Board Name — Espressif ESP32-S3 |
+| `CDCOnBoot=cdc` | Enables USB-Serial via CDC — required for Serial Monitor |
+| `-p /dev/cu.usbmodem1101` | Serial port |
 | `ESP32Code/` | Sketch folder — must match the `.ino` filename inside |
 
 ---
@@ -155,5 +131,5 @@ arduino-cli monitor -p /dev/cu.usbmodem1101 --config baudrate=115200
 
 - **Wheels off the ground** during all initial tests.
 - Common GND is mandatory across ESP32, ESC, servo, and all sensors.
-- System boots **DISARMED** — motors do not move until explicitly armed via web UI.
+- System boots **DISARMED** — motors do not move until explicitly armed via web UI or ARM button.
 - Watchdog: command timeout → motor neutral + DISARMED lock.
